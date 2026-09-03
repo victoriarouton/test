@@ -1,1 +1,277 @@
-test file
+
+Mlflow env diagnose · PY
+"""
+Diagnostic for MLflow "requirements versions are incompatible" failures.
+ 
+Drop this module into your wheel and call `run()` from your job entry point,
+just before the mlflow.log_model / save_model call that fails.
+ 
+Everything prints to stdout, so it lands in the Databricks driver logs.
+ 
+Typical usage inside your job:
+ 
+    from mlflow_env_diagnose import run, capture
+ 
+    run(
+        target="pyjwt",
+        freeze_fn=environ_utils.get_installed_packages,  # or your get_default_pip_requirements
+    )
+ 
+    # then wrap the failing call so we get the verbatim traceback:
+    capture(lambda: mlflow.statsmodels_glm.log_model(model, artifact_path="model"))
+"""
+ 
+from __future__ import annotations
+ 
+import importlib.metadata as im
+import os
+import sys
+import traceback
+from collections import defaultdict
+from typing import Any, Callable, Iterable
+ 
+ 
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+ 
+def _norm(name: str) -> str:
+    """PEP 503-ish normalization, so PyJWT / pyjwt / py_jwt compare equal."""
+    return name.lower().replace("_", "-").replace(".", "-").strip()
+ 
+ 
+def _project_of(requirement_line: str) -> str:
+    """'PyJWT[crypto]==2.10.1' -> 'pyjwt'"""
+    head = requirement_line.split(";")[0].strip()
+    for sep in ("===", "==", ">=", "<=", "~=", "!=", ">", "<", "["):
+        head = head.split(sep)[0]
+    return _norm(head)
+ 
+ 
+def _location(dist: im.Distribution) -> str:
+    for attempt in (lambda: str(dist._path), lambda: str(dist.locate_file(""))):
+        try:
+            return attempt()
+        except Exception:
+            continue
+    return "<unknown>"
+ 
+ 
+def _rule(title: str) -> None:
+    print("\n" + "=" * 72)
+    print(title)
+    print("=" * 72)
+ 
+ 
+# --------------------------------------------------------------------------
+# sections
+# --------------------------------------------------------------------------
+ 
+def _section_environment() -> None:
+    _rule("1. ENVIRONMENT")
+    print("executable :", sys.executable)
+    print("python     :", sys.version.replace("\n", " "))
+    try:
+        print("mlflow     :", im.version("mlflow"))
+    except Exception as exc:
+        print("mlflow     : <not found>", exc)
+ 
+    interesting = ("DATABRICKS", "SERVERLESS", "MLFLOW", "VIRTUAL_ENV", "PYTHONPATH", "PIP_")
+    print("\nrelevant env vars:")
+    for key in sorted(os.environ):
+        if any(token in key.upper() for token in interesting):
+            value = os.environ[key]
+            if len(value) > 200:
+                value = value[:200] + " ...<truncated>"
+            print(f"  {key}={value}")
+ 
+    print("\nsys.path (order matters - first match wins for version lookups):")
+    for entry in sys.path:
+        print("  ", entry)
+ 
+ 
+def _collect() -> tuple[list[im.Distribution], dict[str, list[tuple[str, str, str]]]]:
+    dists: list[im.Distribution] = []
+    by_project: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+ 
+    for dist in im.distributions():
+        try:
+            name = dist.metadata["Name"]
+            if not name:
+                continue
+            dists.append(dist)
+            by_project[_norm(name)].append((name, dist.version, _location(dist)))
+        except Exception as exc:
+            print(f"  !! unreadable distribution metadata: {exc!r}")
+ 
+    return dists, by_project
+ 
+ 
+def _section_duplicates(by_project: dict[str, list[tuple[str, str, str]]]) -> bool:
+    _rule("2. DUPLICATE DISTRIBUTIONS (same project discovered more than once)")
+    duplicates = {k: v for k, v in by_project.items() if len(v) > 1}
+ 
+    if not duplicates:
+        print("NONE. No project is installed in more than one place.")
+        print("-> This rules OUT the duplicate-install explanation.")
+        return False
+ 
+    conflicting = False
+    for project, entries in sorted(duplicates.items()):
+        versions = {version for _, version, _ in entries}
+        marker = "   <<< TWO DIFFERENT VERSIONS" if len(versions) > 1 else ""
+        conflicting = conflicting or len(versions) > 1
+        print(f"\n{project}{marker}")
+        for name, version, location in entries:
+            print(f"    {name}=={version}")
+            print(f"        {location}")
+ 
+    print(f"\n{len(duplicates)} duplicated project(s) total.")
+    return conflicting
+ 
+ 
+def _section_target(target: str, by_project: dict[str, list[tuple[str, str, str]]]) -> None:
+    _rule(f"3. TARGET PACKAGE: {target}")
+    entries = by_project.get(_norm(target))
+ 
+    if not entries:
+        print(f"{target} is NOT installed in this environment.")
+    else:
+        print(f"full scan found {len(entries)} copy/copies:")
+        for name, version, location in entries:
+            print(f"    {name}=={version}")
+            print(f"        {location}")
+ 
+    try:
+        print(f"\nimportlib.metadata.version({target!r}) -> {im.version(target)}")
+        print("   (this API returns only the FIRST match on sys.path,")
+        print("    which is why pip list / normal inspection can look clean)")
+    except Exception as exc:
+        print(f"\nimportlib.metadata.version({target!r}) failed: {exc!r}")
+ 
+ 
+def _section_reverse_deps(target: str, dists: Iterable[im.Distribution]) -> bool:
+    _rule(f"4. WHAT DECLARES A DEPENDENCY ON {target}")
+    found = False
+    for dist in dists:
+        try:
+            for requirement in (dist.requires or []):
+                if _norm(target) in _norm(requirement):
+                    owner = dist.metadata["Name"]
+                    print(f"  {owner}=={dist.version}")
+                    print(f"      requires: {requirement}")
+                    found = True
+        except Exception:
+            continue
+ 
+    if not found:
+        print(f"  Nothing installed declares a dependency on {target}.")
+    else:
+        print("\n-> If any line above is a HARD pin (e.g. ==2.7.0) and your frozen")
+        print("   list pins a different version, that is the conflict, and there")
+        print("   is no duplicate install involved.")
+    return found
+ 
+ 
+def _section_frozen_list(freeze_fn: Callable[..., list[str]] | None) -> None:
+    _rule("5. THE REQUIREMENTS LIST YOUR CODE PRODUCES")
+    if freeze_fn is None:
+        print("skipped - pass freeze_fn=<your get_default_pip_requirements> to enable")
+        return
+ 
+    try:
+        requirements = list(freeze_fn())
+    except Exception:
+        print("freeze_fn raised:")
+        traceback.print_exc()
+        return
+ 
+    print(f"total pinned requirements: {len(requirements)}")
+ 
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for line in requirements:
+        grouped[_project_of(line)].append(line)
+ 
+    repeated = {k: v for k, v in grouped.items() if len(v) > 1}
+    print(f"\nprojects pinned more than once: {len(repeated)}")
+    for project, lines in sorted(repeated.items()):
+        print(f"    {project}: {lines}")
+ 
+    local_versions = [line for line in requirements if "+" in line]
+    print(f"\nlines carrying a local version label (won't resolve on PyPI): {len(local_versions)}")
+    for line in local_versions[:40]:
+        print("   ", line)
+    if len(local_versions) > 40:
+        print(f"    ... and {len(local_versions) - 40} more")
+ 
+    jwt_lines = [line for line in requirements if "jwt" in line.lower()]
+    print(f"\njwt-related lines: {jwt_lines or 'none'}")
+ 
+ 
+def _section_inferred(infer_args: tuple[str, str] | None) -> None:
+    _rule("6. WHAT MLFLOW INFERS ON ITS OWN")
+    if infer_args is None:
+        print("skipped - pass infer_args=(local_model_path, FLAVOR_NAME) to enable")
+        return
+ 
+    model_path, flavor_name = infer_args
+    try:
+        import mlflow.models
+ 
+        inferred = mlflow.models.infer_pip_requirements(model_path, flavor_name, fallback=[])
+        print(f"inferred {len(inferred)} requirement(s):")
+        for line in inferred:
+            print("   ", line)
+        print(f"\njwt-related: {[r for r in inferred if 'jwt' in r.lower()] or 'none'}")
+    except Exception:
+        print("infer_pip_requirements raised:")
+        traceback.print_exc()
+ 
+ 
+# --------------------------------------------------------------------------
+# public entry points
+# --------------------------------------------------------------------------
+ 
+def run(
+    target: str = "pyjwt",
+    freeze_fn: Callable[..., list[str]] | None = None,
+    infer_args: tuple[str, str] | None = None,
+) -> None:
+    """Print everything needed to identify the source of the version conflict."""
+    print("\n" + "#" * 72)
+    print("# MLflow requirements conflict diagnostic")
+    print("#" * 72)
+ 
+    _section_environment()
+    dists, by_project = _collect()
+    had_conflicting_dupes = _section_duplicates(by_project)
+    _section_target(target, by_project)
+    had_reverse_dep = _section_reverse_deps(target, dists)
+    _section_frozen_list(freeze_fn)
+    _section_inferred(infer_args)
+ 
+    _rule("VERDICT")
+    if had_conflicting_dupes:
+        print(f"Duplicate installs with differing versions were found.")
+        print("-> The environment scan is the likely source of the two pins.")
+    elif had_reverse_dep:
+        print("No conflicting duplicates, but something declares a dependency on")
+        print(f"{target}. Check whether that declaration is a hard pin.")
+    else:
+        print("Neither duplicates nor a declared dependency explain it.")
+        print("-> The second pin is most likely arriving via pip_requirements /")
+        print("   extra_pip_requirements at the call site.")
+ 
+ 
+def capture(call: Callable[[], Any]) -> Any:
+    """Run the failing call and print the verbatim traceback if it raises."""
+    _rule("VERBATIM FAILURE FROM THE LOGGING CALL")
+    try:
+        result = call()
+        print("call succeeded - no exception raised")
+        return result
+    except Exception:
+        traceback.print_exc()
+        return None
+ 
+
