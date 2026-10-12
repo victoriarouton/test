@@ -1,1 +1,151 @@
-test
+@contextmanager
+def parent_run_lock(
+    experiment_name: str, spark: SparkSession | None = None
+) -> Generator[None]:
+    spark = spark or create_default_spark_session()
+    key = {"table": TABLE, "experiment": experiment_name}
+
+    # One partition per experiment, so experiments never block each other
+    spark.sql(
+        """
+        CREATE TABLE IF NOT EXISTS IDENTIFIER(:table)
+        (experiment STRING, owner STRING, taken_at TIMESTAMP)
+        PARTITIONED BY (experiment)
+        """,
+        args={"table": TABLE},
+    )
+    with suppress(*CONFLICTS):  # another job added this experiment's row first
+        spark.sql(
+            """
+            MERGE INTO IDENTIFIER(:table) AS t USING (SELECT 1) AS s
+            ON t.experiment = :experiment
+            WHEN NOT MATCHED THEN INSERT (experiment) VALUES (:experiment)
+            """,
+            args=key,
+        )
+
+    me = uuid4().hex
+    owner: str | None = None
+
+    # Take the lock when it's free, or when its holder has held it too long
+    while owner != me:
+        with suppress(*CONFLICTS):  # another job got it first
+            spark.sql(
+                """
+                UPDATE IDENTIFIER(:table) SET owner = :me, taken_at = now()
+                WHERE experiment = :experiment
+                  AND (owner IS NULL OR taken_at < now() - :expiry)
+                """,
+                args={**key, "me": me, "expiry": EXPIRY},
+            )
+        rows = spark.table(TABLE)
+        owner = rows.where(rows["experiment"] == experiment_name).collect()[0].owner
+
+    try:
+        yield
+    finally:
+        spark.sql(
+            """
+            UPDATE IDENTIFIER(:table) SET owner = NULL
+            WHERE experiment = :experiment AND owner = :me
+            """,
+            args={**key, "me": me},
+        )
+
+
+
+
+@patch.object(delta_lock, "uuid4")
+def test_takes_and_releases_lock(mock_uuid4):
+    mock_uuid4.return_value.hex = "job-1"
+    spark = MagicMock()
+    spark.table().where().collect.return_value = [Row(owner="job-1")]
+
+    with delta_lock.parent_run_lock("my_exp", spark):
+        pass
+
+    _, _, take, release = spark.sql.call_args_list
+    assert take.kwargs["args"]["me"] == release.kwargs["args"]["me"] == "job-1"
+    assert take.kwargs["args"]["experiment"] == "my_exp"
+    assert take.kwargs["args"]["expiry"] == delta_lock.EXPIRY
+    assert "WHERE experiment = :experiment" in take.args[0]
+    assert "AND owner = :me" in release.args[0]
+
+
+@patch.object(delta_lock, "uuid4")
+def test_waits_while_another_job_has_the_lock(mock_uuid4):
+    mock_uuid4.return_value.hex = "job-1"
+    spark = MagicMock()
+    spark.table().where().collect.side_effect = [
+        [Row(owner="job-2")],
+        [Row(owner="job-1")],
+    ]
+
+    with delta_lock.parent_run_lock("my_exp", spark):
+        pass
+
+    assert spark.sql.call_count == 5  # create, add row, 2 tries, release
+
+
+@patch.object(delta_lock, "uuid4")
+def test_retries_after_a_conflict(mock_uuid4):
+    mock_uuid4.return_value.hex = "job-1"
+    conflict = ConcurrentAppendException("another job got there first")
+    spark = MagicMock()
+    spark.sql.side_effect = [None, None, conflict, None, None]
+    spark.table().where().collect.side_effect = [
+        [Row(owner=None)],
+        [Row(owner="job-1")],
+    ]
+
+    with delta_lock.parent_run_lock("my_exp", spark):
+        pass
+
+    assert spark.sql.call_count == 5
+
+
+@patch.object(delta_lock, "uuid4")
+def test_ignores_conflict_when_another_job_adds_the_row(mock_uuid4):
+    mock_uuid4.return_value.hex = "job-1"
+    conflict = ConcurrentAppendException("another job added it first")
+    spark = MagicMock()
+    spark.sql.side_effect = [None, conflict, None, None]
+    spark.table().where().collect.return_value = [Row(owner="job-1")]
+
+    with delta_lock.parent_run_lock("my_exp", spark):
+        pass
+
+    assert spark.sql.call_count == 4
+
+
+def test_other_errors_are_raised():
+    spark = MagicMock()
+    spark.sql.side_effect = [None, None, PermissionError("no access")]
+
+    with pytest.raises(PermissionError), delta_lock.parent_run_lock("my_exp", spark):
+        pass
+
+
+@patch.object(delta_lock, "uuid4")
+def test_releases_lock_when_code_fails(mock_uuid4):
+    mock_uuid4.return_value.hex = "job-1"
+    spark = MagicMock()
+    spark.table().where().collect.return_value = [Row(owner="job-1")]
+
+    with pytest.raises(ValueError), delta_lock.parent_run_lock("my_exp", spark):
+        raise ValueError("boom")
+
+    assert "SET owner = NULL" in spark.sql.call_args.args[0]
+
+
+@patch.object(delta_lock, "create_default_spark_session")
+@patch.object(delta_lock, "uuid4")
+def test_creates_spark_session_if_none_given(mock_uuid4, mock_create_session):
+    mock_uuid4.return_value.hex = "job-1"
+    spark = mock_create_session.return_value
+    spark.table().where().collect.return_value = [Row(owner="job-1")]
+
+    with delta_lock.parent_run_lock("my_exp"):
+        pass
+
+    mock_create_session.assert_called_once()
